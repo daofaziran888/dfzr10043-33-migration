@@ -24,6 +24,9 @@ from app.services.version_release import VersionReleaseService
 from app.services.metric_board import MetricBoardService
 from app.services.sample_check import SampleCheckService
 from app.services.handoff_pack import HandoffPackService
+from app.services.landing_receipt import LandingReceiptService
+from app.services.backfill_queue import BackfillQueueService
+from app.services.window_migration import WindowMigrationService
 
 SERVICES: dict[str, BaseModuleService] = {
     "flow_template": FlowTemplateService(),
@@ -48,6 +51,9 @@ SERVICES: dict[str, BaseModuleService] = {
     "metric_board": MetricBoardService(),
     "sample_check": SampleCheckService(),
     "handoff_pack": HandoffPackService(),
+    "landing_receipt": LandingReceiptService(),
+    "backfill_queue": BackfillQueueService(),
+    "window_migration": WindowMigrationService(),
 }
 
 

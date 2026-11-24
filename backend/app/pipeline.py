@@ -15,6 +15,10 @@
 额外能力：水位推进（data_landing watermark）、冲突版本仲裁（version_release rollback =
 旧版本胜出）、失败恢复（retry_policy 重试→放弃→审计）、去重（capture_batch 按采集窗
 口与上游来源判重，重复批次不落库）、迟到数据（schedule_plan 生效止日已过则拒绝投递）。
+
+链路11 来源窗口迁移 → 逐段核验 → 落库回执 → 补采队列派发：
+旧日标签批次收到机器人跨午夜补报后，只登记真实区间；核验按来源时区午夜切段、
+可中断可恢复；已交付片段抵扣，未核验片段阻断派发。见 ``migrate_source_window``。
 """
 from __future__ import annotations
 
@@ -146,9 +150,23 @@ def publish_flow_and_schedule(template_id: int, plan_payload: dict[str, Any]) ->
 # ── 链路2: 文件归集校验 → 采集批次确认 → 字段映射生效 → 数据落库 → 交接包消费 ─
 
 def collect_files_and_land_data(run_id: int, file_payloads: list[dict[str, Any]],
-                                 mapping_ids: list[int]) -> dict[str, Any]:
-    """归集流程执行产生的文件，校验后确认采集批次，经字段映射落库并打包交接。"""
+                                 mapping_ids: list[int],
+                                 source_window: Any | None = None) -> dict[str, Any]:
+    """归集流程执行产生的文件，校验后确认采集批次，经字段映射落库并打包交接。
+
+    ``source_window`` 可选：机器人给出精确来源窗口后，批次记录真实起止与
+    时区；未给出时保留旧日标签行为，绝不伪造时间戳。
+    """
     run_entry = _find_entry("flow_run", run_id)
+    window = None
+    if source_window is not None:
+        from app.source_window import SourceWindow
+
+        window = (
+            source_window
+            if isinstance(source_window, SourceWindow)
+            else SourceWindow.from_report(source_window)[0]
+        )
 
     # 文件归集
     file_svc = service_for("file_drop")
@@ -192,7 +210,14 @@ def collect_files_and_land_data(run_id: int, file_payloads: list[dict[str, Any]]
         "批次编号": f"CAPT-R{run_id}",
         "关联执行": run_entry.get("执行编号", ""),
         "记录行数": str(len(collected)),
-        "采集窗口": f"[{_now_iso()[:10]}]",
+        # 历史/未提供窗口时仍写日标签；有精确窗口则写真实区间。
+        "采集窗口": window.label if window is not None else f"[{_now_iso()[:10]}]",
+        "原始日标签": f"[{_now_iso()[:10]}]",
+        "来源窗口起": window.start_iso if window is not None else "",
+        "来源窗口止": window.end_iso if window is not None else "",
+        "来源时区": window.tz_name if window is not None else "",
+        "窗口核验状态": "已上报" if window is not None else "未迁移",
+        "已核验片段": "[]",
         "完整性校验": batch_checksum,
         "批次标签": "file-collect",
         "上游来源": dup_check,
@@ -242,6 +267,7 @@ def collect_files_and_land_data(run_id: int, file_payloads: list[dict[str, Any]]
         "校验摘要": batch_checksum,
         "交接版本": "v1",
         "交接时间": _now_iso(),
+        "原始日标签": batch_values["原始日标签"],
     }
     handoff_result, _ = handoff_svc.create_entry(handoff_values)
     handoff_svc.run_action(handoff_result["id"], "启动打包")
@@ -607,3 +633,81 @@ def summarize_metrics(metric_id: int) -> dict[str, Any]:
         "mismatch": mismatch,
         "audit_id": audit_result["id"],
     }
+
+# ── 链路11: 来源窗口迁移 → 逐段核验 → 落库回执 → 补采队列 ─
+
+def migrate_source_window(batch_ref: Any, report: Any, *,
+                          verifier: Callable[[Any], Any] | None = None,
+                          interrupt_after: int | None = None,
+                          operator: str = "robot") -> dict[str, Any]:
+    """用机器人补报的真实区间迁移旧日标签批次。
+
+    只登记补报给出的起止与时区，不把旧日标签改写成臆造时间戳；同一批次
+    同一精确窗口重复补传只确认一次。
+    """
+    mig_svc = service_for("window_migration")
+    if mig_svc is None:
+        raise RuntimeError("服务未注册: window_migration")
+    return mig_svc.report_window(batch_ref, report, operator=operator)
+
+
+def verify_source_window_migration(migration_id: int, *,
+                                   verifier: Callable[[Any], Any] | None = None,
+                                   interrupt_after: int | None = None,
+                                   operator: str = "duty") -> dict[str, Any]:
+    """逐段核验迁移；``interrupt_after`` 可模拟迁移中断，结果已落库可恢复。"""
+    mig_svc = service_for("window_migration")
+    if mig_svc is None:
+        raise RuntimeError("服务未注册: window_migration")
+    return mig_svc.verify(
+        migration_id, verifier=verifier,
+        interrupt_after=interrupt_after, operator=operator,
+    )
+
+
+def resume_source_window_migration(migration_id: int, *,
+                                   verifier: Callable[[Any], Any] | None = None,
+                                   operator: str = "duty") -> dict[str, Any]:
+    """恢复已中断的迁移；只处理未核验/失败片段，已核验片段不重复出回执。"""
+    mig_svc = service_for("window_migration")
+    if mig_svc is None:
+        raise RuntimeError("服务未注册: window_migration")
+    return mig_svc.resume(migration_id, verifier=verifier, operator=operator)
+
+
+def query_backfill_queue(**query: Any) -> dict[str, Any]:
+    """按精确区间查询补采队列，并给出每段实际可派的判定。
+
+    这是值班员当晚派发前的事实来源：已核验且未抵扣的片段可派；其余片段
+    无论时间是否落回原日标签，都不能被猜测成可派区间。
+    """
+    bf_svc = service_for("backfill_queue")
+    if bf_svc is None:
+        raise RuntimeError("服务未注册: backfill_queue")
+    filters = {k: v for k, v in query.items() if v not in (None, "")}
+    items, total = bf_svc.list_entries(filters=filters, page=1, size=10000)
+    dispatchable, blocked = [], []
+    for item in items:
+        target = dispatchable if (
+            item.get("status") == "待派发" and item.get("核验状态") == "已核验"
+        ) else blocked
+        target.append({
+            "task_id": item.get("id"),
+            "任务编号": item.get("任务编号"),
+            "区间起": item.get("区间起"),
+            "区间止": item.get("区间止"),
+            "时区": item.get("时区"),
+            "status": item.get("status"),
+            "核验状态": item.get("核验状态"),
+            "阻断原因": item.get("阻断原因"),
+        })
+    return {"total": total, "items": items, "dispatchable": dispatchable, "blocked": blocked}
+
+
+def dispatch_backfill_interval(task_id: int, *, node: str = "",
+                               operator: str = "duty") -> dict[str, Any]:
+    """尝试派发一段补采区间；结果以迁移核验为准，重复尝试不会重复派发。"""
+    bf_svc = service_for("backfill_queue")
+    if bf_svc is None:
+        raise RuntimeError("服务未注册: backfill_queue")
+    return bf_svc.attempt_dispatch(task_id, operator=operator, node=node)
